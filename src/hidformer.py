@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.fft as fft
+import yfinance as yf
 
 #Blocks
 
@@ -71,16 +72,25 @@ def train(model, train_loader, val_loader, num_epochs=10):
     """
     Train the Hidformer model.
     """
+
+def getData():
+    """
+    Load the dataset.
+    """
+    data = yf.download("AAPL", start="2020-01-01", end="2023-01-01")
+    data.to_csv("AAPL.csv")
+    
     
 
 if __name__ == "__main__":
-    # Example usage
-    model = Hidformer()
-    print(model)
+    getData()
+    # # Example usage
+    # model = Hidformer()
+    # print(model)
     
-    # Dummy data
-    x = torch.randn(32, 16, 32)  # (batch_size, seq_len, d_model)
+    # # Dummy data
+    # x = torch.randn(32, 16, 32)  # (batch_size, seq_len, d_model)
     
-    # Forward pass
-    output = model(x)
-    print(output.shape)
+    # # Forward pass
+    # output = model(x)
+    # print(output.shape)
