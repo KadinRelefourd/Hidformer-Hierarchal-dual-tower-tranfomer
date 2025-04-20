@@ -2,6 +2,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.fft as fft
+import yfinance as yf
+import pandas as pd
+import os
+from torch.utils.data import DataLoader, Dataset, TensorDataset
+from preprocessing import createDataset
 
 #Blocks
 
@@ -71,16 +76,31 @@ def train(model, train_loader, val_loader, num_epochs=10):
     """
     Train the Hidformer model.
     """
-    
+ 
 
 if __name__ == "__main__":
-    # Example usage
-    model = Hidformer()
-    print(model)
+    USE_CUDA = torch.cuda.is_available()
+    device = torch.device("cuda" if USE_CUDA else "cpu")
+    #getData("AAPL")
+    createDataset(
+        ticker_list_csv_path="./src/tickers.csv",
+        root="./data/",
+        lookback_window=16,
+        prediction_horizon=7,
+        split='train',
+        target_column='Close',
+        feature_columns=None,
+        download=True,
+        split_percentages=(0.7, 0.15, 0.15),
+        force_regenerate=False
+    )
+    # # Example usage
+    # model = Hidformer()
+    # print(model)
     
-    # Dummy data
-    x = torch.randn(32, 16, 32)  # (batch_size, seq_len, d_model)
+    # # Dummy data
+    # x = torch.randn(32, 16, 32)  # (batch_size, seq_len, d_model)
     
-    # Forward pass
-    output = model(x)
-    print(output.shape)
+    # # Forward pass
+    # output = model(x)
+    # print(output.shape)
