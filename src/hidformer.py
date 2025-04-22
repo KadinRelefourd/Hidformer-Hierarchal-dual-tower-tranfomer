@@ -281,65 +281,207 @@ class FrequencyBlock(nn.Module):
     def forward(self, x):
         x_norm = self.norm1(x)
         x = self.mixer(x_norm) + x
-        x_norm = self.norm1(x)
+        x_norm = self.norm2(x)
         x = self.ffn(x_norm) + x
 
         return x
 
 
 class Hidformer(nn.Module):
+    """
+    Hidformer model implementing hierarchical dual towers with multi-scale mergence.
+    Based on Liu et al., 2024. Uses Pre-Normalization blocks.
+    """
+
     def __init__(
         self,
-        input_dim,
-        token_length=16,
-        stride=8,
-        time_blocks=4,
-        freq_blocks=2,
-        hidden_size=128,
-        freq_k=64,
-        dout=0.2,
-        out_dim=None,
+        input_dim: int,  # Number of input features (C)
+        pred_len: int,  # Prediction horizon (H)
+        token_length: int = 16,  # Length of each token segment (T_token)
+        stride: int = 8,  # Stride for token segmentation (S)
+        num_time_blocks: int = 4,  # Number of blocks in Time Tower
+        num_freq_blocks: int = 2,  # Number of blocks in Frequency Tower
+        d_model: int = 128,  # Main dimension of the model's hidden states
+        # time_hidden_factor: int = 1, # SRUpp hidden dim factor (removed, assume d_hidden=d_model)
+        freq_k: int = 64,  # Low-rank dimension for LinearAttention
+        dropout: float = 0.2,  # Dropout rate
+        merge_mode: str = "linear",  # Mode for MergenceLayer ('linear' or 'mean')
+        merge_k: int = 2,  # How many tokens to merge at each step
     ):
         super().__init__()
-        self.rev_in = RevIN(input_dim)
-        self.segmenter = SegmentMerge(
-            token_length, stride, max(time_blocks, freq_blocks)
-        )
-        token_dim = input_dim * token_length
-        self.time_tower = nn.ModuleList(
-            [TimeBlock(token_dim, hidden_size) for _ in range(time_blocks)]
-        )
-        self.freq_tower = nn.ModuleList(
-            [FrequencyBlock(token_dim, freq_k) for _ in range(freq_blocks)]
-        )
-        # adaptors
-        self.time_adapt = nn.Linear(token_dim, token_dim)
-        self.freq_adapt = nn.Linear(token_dim, token_dim)
-        # final decoder
-        total_feats = token_dim * (time_blocks + freq_blocks)
-        self.decoder = nn.Linear(total_feats, out_dim or input_dim)
+        self.pred_len = pred_len
+        self.input_dim = input_dim
+        self.d_model = d_model
 
-    def forward(self, x):
-        # x: (B, T, C) -> (B, C, T)
-        x = x.transpose(1, 2)
-        x_norm = self.rev_in(x, mode="norm")
-        # segmentation + hierarchical outputs
-        multi_tokens = self.segmenter(x_norm)  # list of length L: (B, Ni, token_dim)
-        t_feats = []
-        for tokens, block in zip(multi_tokens[: len(self.time_tower)], self.time_tower):
-            out = block(tokens)  # (B, Ni, dim)
-            t_feats.append(self.time_adapt(out.mean(dim=1)))
-        # frequency tower: FFT then blocks
-        fft_tokens = torch.fft.rfft(multi_tokens[0], dim=1).real
-        f_feats = []
-        for tokens, block in zip(
-            [fft_tokens] + multi_tokens[1 : len(self.freq_tower)], self.freq_tower
-        ):
-            out = block(tokens)
-            f_feats.append(self.freq_adapt(out.mean(dim=1)))
-        # concat and decode
-        all_feats = torch.cat(t_feats + f_feats, dim=-1)
-        pred = self.decoder(all_feats)
-        # denormalize -> (B, C, T')
-        # Here pred is (B, C) for horizon prediction; adapt as needed
-        return pred
+        # 1. Normalization
+        self.rev_in = RevIN(input_dim)  # Operates on (B, C, T_in)
+
+        # 2. Initial Tokenization
+        self.segmenter = TokenizeSequence(token_length, stride)
+        # Output: (B, N, C*token_length)
+        initial_token_dim = input_dim * token_length
+
+        # 3. Input Projection (Project initial tokens to d_model)
+        self.input_proj = nn.Linear(initial_token_dim, d_model)
+
+        # --- Towers ---
+        # Use separate ModuleLists for blocks and mergers
+        self.time_blocks = nn.ModuleList()
+        self.time_mergers = nn.ModuleList()
+        for i in range(num_time_blocks):
+            # TimeBlock uses d_model for input and hidden size
+            self.time_blocks.append(
+                TimeBlock(d_model=d_model, hidden_size=d_model, dropout=dropout)
+            )
+            if i < num_time_blocks - 1:  # Add merger except after last block
+                self.time_mergers.append(
+                    MergenceLayer(d_model=d_model, k=merge_k, mode=merge_mode)
+                )
+
+        self.freq_blocks = nn.ModuleList()
+        self.freq_mergers = nn.ModuleList()
+        # Projection layer for FFT output before feeding to Frequency Tower
+        # FFT output size depends on input length T_in. Let's make it adaptive later.
+        # For now, assume we project FFT tokens back to d_model.
+        self.fft_proj = None  # Will initialize lazily in forward
+
+        for i in range(num_freq_blocks):
+            self.freq_blocks.append(
+                FrequencyBlock(d_model=d_model, k=freq_k, dropout=dropout)
+            )
+            if i < num_freq_blocks - 1:
+                self.freq_mergers.append(
+                    MergenceLayer(d_model=d_model, k=merge_k, mode=merge_mode)
+                )
+
+        # --- Decoder ---
+        # Following Fig 4: Adapt final tower outputs, concatenate, then decode
+        self.time_adaptor = nn.Linear(
+            d_model, d_model
+        )  # Adapts final time tower output
+        self.freq_adaptor = nn.Linear(
+            d_model, d_model
+        )  # Adapts final freq tower output
+        decoder_input_dim = d_model * 2  # After adaptation and concatenation
+
+        # Final linear head for prediction
+        # Predicts pred_len steps for each of the input_dim features
+        self.decoder = nn.Linear(decoder_input_dim, self.pred_len * self.input_dim)
+
+    def forward(self, x_enc: torch.Tensor) -> torch.Tensor:
+        # x_enc: (B, T_in, C) - Input historical data
+        B, T_in, C = x_enc.shape
+        if C != self.input_dim:
+            raise ValueError(
+                f"Input feature dim {C} != init input_dim {self.input_dim}"
+            )
+
+        # 1. RevIN Normalization
+        x_enc_transposed = x_enc.transpose(1, 2)  # (B, C, T_in)
+        x_norm = self.rev_in(x_enc_transposed, mode="norm")  # (B, C, T_in)
+
+        # --- Time Tower Path ---
+        # 2. Initial Tokenization for Time Tower
+        time_tokens = self.segmenter(x_norm)  # (B, N, C*token_length)
+        # 3. Project to d_model
+        time_tokens = self.input_proj(time_tokens)  # (B, N, d_model)
+
+        # 4. Process through Time Tower blocks and mergers
+        current_time_tokens = time_tokens
+        time_block_outputs = (
+            []
+        )  # Store output of each block if needed for other agg strategies
+        for i, block in enumerate(self.time_blocks):
+            processed_tokens = block(current_time_tokens)  # (B, Ni, d_model)
+            time_block_outputs.append(processed_tokens)  # Store output
+            if i < len(self.time_mergers):
+                current_time_tokens = self.time_mergers[i](processed_tokens)
+            else:
+                final_time_output = processed_tokens  # Output of the last block
+
+        # --- Frequency Tower Path ---
+        # 1. Apply FFT to the *normalized input sequence* (more standard)
+        fft_output = torch.fft.rfft(x_norm, dim=-1)  # (B, C, T_freq)
+        # Use magnitude and phase or just magnitude? Let's use magnitude for simplicity.
+        # Could concatenate real/imag parts as features too.
+        fft_features = fft_output.abs()  # (B, C, T_freq)
+
+        # 2. Tokenize the frequency features
+        # Need to handle potential dimension mismatch if T_freq is different
+        # For simplicity, let's assume TokenizeSequence can handle (B, C, T_freq)
+        # This might require adjusting stride/token_length for frequency domain
+        # Or pad/truncate T_freq to match T_in expectations?
+        # Alternative: Use a different tokenizer or adapt FrequencyBlocks.
+
+        # --- Let's try tokenizing frequency features directly ---
+        # This assumes token_length and stride are meaningful for frequency domain.
+        # May need separate token_length_freq, stride_freq parameters.
+        # For now, reuse time tokenizer settings.
+        try:
+            freq_tokens = self.segmenter(
+                fft_features
+            )  # (B, N_freq, C*token_length_freq)
+        except ValueError as e:
+            # Handle cases where T_freq < token_length
+            print(
+                f"Warning: Could not tokenize frequency features due to length. Skipping Freq Tower. Error: {e}"
+            )
+            # Create a dummy zero tensor for freq path output if needed
+            final_freq_output = torch.zeros_like(final_time_output)  # Match shape
+            freq_tokens_proj = torch.zeros_like(time_tokens)  # Match shape
+        else:
+            # 3. Project frequency tokens to d_model
+            # Lazy initialization of FFT projection layer
+            if self.fft_proj is None:
+                fft_token_dim = freq_tokens.shape[-1]
+                self.fft_proj = nn.Linear(fft_token_dim, self.d_model).to(x_enc.device)
+            freq_tokens_proj = self.fft_proj(freq_tokens)  # (B, N_freq, d_model)
+
+            # 4. Process through Frequency Tower blocks and mergers
+            current_freq_tokens = freq_tokens_proj
+            freq_block_outputs = []
+            for i, block in enumerate(self.freq_blocks):
+                processed_tokens = block(current_freq_tokens)  # (B, Ni_freq, d_model)
+                freq_block_outputs.append(processed_tokens)
+                if i < len(self.freq_mergers):
+                    current_freq_tokens = self.freq_mergers[i](processed_tokens)
+                else:
+                    final_freq_output = processed_tokens  # Output of the last block
+
+        # --- Aggregation & Decoder (Following Fig 4) ---
+        # Aggregate final outputs (e.g., mean pool over sequence dim N)
+        # Ensure outputs exist (handle skipped freq tower case)
+        if "final_time_output" not in locals():
+            raise RuntimeError("Time tower did not produce an output.")
+        if "final_freq_output" not in locals():
+            # Handle case where freq tower was skipped
+            print("Warning: Frequency tower output missing, using zeros.")
+            final_freq_output = torch.zeros_like(final_time_output)
+
+        # Use mean aggregation over the token sequence dimension
+        agg_time = final_time_output.mean(dim=1)  # (B, d_model)
+        agg_freq = final_freq_output.mean(dim=1)  # (B, d_model)
+
+        # Adapt aggregated outputs
+        adapted_time = self.time_adaptor(agg_time)  # (B, d_model)
+        adapted_freq = self.freq_adaptor(agg_freq)  # (B, d_model)
+
+        # Concatenate adapted features
+        combined_features = torch.cat(
+            [adapted_time, adapted_freq], dim=-1
+        )  # (B, d_model * 2)
+
+        # Final Decoder
+        pred = self.decoder(combined_features)  # (B, pred_len * input_dim)
+
+        # Reshape prediction: (B, pred_len, input_dim)
+        pred = pred.view(B, self.pred_len, self.input_dim)
+
+        # Transpose for RevIN: (B, input_dim, pred_len)
+        pred = pred.transpose(1, 2)
+
+        # 5. Denormalize Output
+        pred_denorm = self.rev_in(pred, mode="denorm")  # (B, C, pred_len)
+
+        # Final output shape: (B, pred_len, C)
+        return pred_denorm.transpose(1, 2)
