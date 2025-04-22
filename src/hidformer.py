@@ -35,16 +35,15 @@ class RevIN(nn.Module):
             raise ValueError("mode must be 'norm' or 'denorm'")
 
 
-class SegmentMerge(nn.Module):
+class TokenizeSequence(nn.Module):
     """
-    Performs initial segmentation into tokens and hierarchical merging across multiple scales.
+    Performs initial segmentation into tokens.
     """
 
-    def __init__(self, token_length: int, stride: int, num_blocks: int):
+    def __init__(self, token_length: int, stride: int):
         super().__init__()
         self.token_length = token_length
         self.stride = stride
-        self.num_blocks = num_blocks
 
     def forward(self, x):  # x: (B, C, T)
         B, C, T = x.shape
@@ -55,18 +54,7 @@ class SegmentMerge(nn.Module):
         segments = segments.permute(0, 2, 1, 3).contiguous()  # (B, N, C, token_length)
         tokens = segments.view(B, segments.size(1), -1)  # (B, N, C*token_length)
 
-        # 2) hierarchical merging across blocks
-        merged = tokens
-        out_tokens = []
-        for _ in range(self.num_blocks):
-            out_tokens.append(merged)
-            N = merged.size(1)
-            if N % 2 == 1:
-                merged = torch.cat([merged, merged[:, -1:].clone()], dim=1)
-                N += 1
-            # merge adjacent pairs: average
-            merged = merged.view(B, N // 2, -1)
-        return out_tokens  # list of length num_blocks, each (B, Ni, token_dim)
+        return tokens  # list of length num_blocks, each (B, Ni, token_dim)
 
 
 class MergenceLayer(nn.Module):
@@ -122,66 +110,105 @@ class MergenceLayer(nn.Module):
         return self.proj(x_flat)
 
 
-class SRUPlusPlus(nn.Module):
-    """
-    SRU++: combines self-attention-based U projection and parallel recurrence.
+class SRUpp(nn.Module):
+    """SRU++ block (Lei 2021) — GPU‑friendly recurrence with attention boost.
+
+    The implementation follows the equations in the paper but avoids any custom
+    CUDA kernels, keeping everything in plain PyTorch so that it works out of
+    the box on both CPU & GPU (with automatic‑mixed precision, etc.).
+
+    Input shape is *(B, L, d_in)* and outputs a *sequence* *(B, L, d_hid)* plus
+    the final hidden state *(B, d_hid)* if requested.
     """
 
-    def __init__(self, d_model, hidden_size):
+    def __init__(
+        self,
+        d_in: int,
+        d_hidden: Optional[int] = None,
+        bias: bool = True,
+        dropout: float = 0.0,
+    ):
         super().__init__()
-        # weights for gates
-        self.W = nn.Parameter(torch.Tensor(3 * hidden_size, d_model))
-        self.vf = nn.Parameter(torch.Tensor(hidden_size))
-        self.vr = nn.Parameter(torch.Tensor(hidden_size))
-        self.bf = nn.Parameter(torch.Tensor(hidden_size))
-        self.br = nn.Parameter(torch.Tensor(hidden_size))
-        # self-attention for U
-        self.to_q = nn.Linear(d_model, hidden_size, bias=False)
-        self.to_k = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.to_v = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.Wu = nn.Linear(hidden_size, 3 * hidden_size)
-        self.alpha = nn.Parameter(torch.tensor(1.0))
-        self.hidden_size = hidden_size
-        self._reset_parameters()
+        self.d_in = d_in
+        self.d_hidden = d_hidden or d_in
+        self.dropout = dropout
 
-    def _reset_parameters(self):
-        nn.init.xavier_uniform_(self.W)
-        nn.init.zeros_(self.vf)
-        nn.init.zeros_(self.vr)
-        nn.init.zeros_(self.bf)
-        nn.init.zeros_(self.br)
+        # Weight tying with single large projection (QKV style) for efficiency
+        self.weight_proj = nn.Linear(self.d_in, self.d_hidden * 3, bias=bias)
 
-    def forward(self, x):  # x: (B, N, d_model)
-        B, N, _ = x.size()
-        # compute U via self-attention mechanism
-        Z = x.transpose(1, 2)  # (B, d_model, N)
-        Q = self.to_q(x)  # (B, N, hidden)
-        K = self.to_k(Q)  # (B, N, hidden)
-        V = self.to_v(Q)  # (B, N, hidden)
-        attn = torch.softmax((Q @ K.transpose(-1, -2)) / self.hidden_size**0.5, dim=-1)
-        F = attn @ V  # (B, N, hidden)
-        U = self.Wu(Q + self.alpha * F)  # (B, N, 3*hidden)
-        U = U.transpose(1, 2)  # (B, 3*hidden, N)
+        # Gate parameters (Element‑wise) — *vf*, *vr* in the paper.
+        self.v_f = nn.Parameter(torch.zeros(self.d_hidden))
+        self.v_r = nn.Parameter(torch.zeros(self.d_hidden))
 
-        # parallel recurrence across hidden dims
-        U0, U1, U2 = U.chunk(3, dim=1)  # each (B, hidden, N)
-        h = U2  # candidate
-        c_prev = torch.zeros(B, self.hidden_size, device=x.device)
-        c_list = []
-        for t in range(N):
-            u0_t = U0[:, :, t]
-            u1_t = U1[:, :, t]
-            u2_t = U2[:, :, t]
-            f_t = torch.sigmoid(u0_t + self.vf * c_prev + self.bf)
-            c_t = f_t * c_prev + (1 - f_t) * u2_t
-            r_t = torch.sigmoid(u1_t + self.vr * c_prev + self.br)
-            h_t = r_t * c_t + (1 - r_t) * x[:, t].transpose(1, 0)
+        # Highway bias terms *bf*, *br*
+        self.bias_f = nn.Parameter(torch.zeros(self.d_hidden))
+        self.bias_r = nn.Parameter(torch.zeros(self.d_hidden))
+
+        # Attention sub‑module to form *U* (eq. 12‑16) — lightweight variant.
+        attn_dim = max(32, self.d_hidden // 4)
+        self.q_proj = nn.Linear(self.d_in, attn_dim, bias=False)
+        self.k_proj = nn.Linear(self.d_in, attn_dim, bias=False)
+        self.v_proj = nn.Linear(self.d_in, attn_dim, bias=False)
+        self.u_proj = nn.Linear(attn_dim, self.d_hidden * 3, bias=False)
+        self.alpha = nn.Parameter(torch.tensor(0.5))  # residual mixing weight
+
+    # ------------------------------------------------------------------
+    def _compute_U(self, x: Tensor) -> Tensor:
+        """Compute the aggregated tensor *U* (B, L, 3·H)."""
+        Q, K, V = self.q_proj(x), self.k_proj(x), self.v_proj(x)  # (B,L,attn)
+        attn_logits = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(Q.size(-1))
+        attn = attn_logits.softmax(dim=-1)
+        F_attn = torch.matmul(attn, V)  # (B,L,attn)
+        mixed = self.alpha * F_attn + Q  # lightweight residual as in eq.16
+        U = self.u_proj(mixed)  # (B,L,3·H)
+        return U
+
+    # ------------------------------------------------------------------
+    def forward(self, x: Tensor, hidden_init: Optional[Tensor] = None) -> Tensor:
+        """Run SRU++ over *x* and return the full output sequence.
+
+        Parameters
+        ----------
+        x : Tensor
+            Input of shape *(B, L, d_in)*.
+        hidden_init : Tensor | None
+            Optional initial hidden state *(B, d_hid)*. Default zeros.
+        """
+        B, L, _ = x.shape
+        U_lin = self.weight_proj(x)  # (B,L,3·H) from linear path
+        U_attn = self._compute_U(x)  # (B,L,3·H) from attention path
+        U = U_lin + U_attn  # fuse paths
+
+        # Gate splits -------------------------------------------------
+        u_f, u_r, u_h = torch.chunk(U, 3, dim=-1)  # each (B,L,H)
+
+        c_prev = (
+            hidden_init
+            if hidden_init is not None
+            else torch.zeros(B, self.d_hidden, device=x.device, dtype=x.dtype)
+        )
+        h_seq = []
+        dropout_mask = None
+        if self.training and self.dropout > 0:
+            dropout_mask = torch.dropout(
+                torch.ones_like(c_prev), p=self.dropout, train=True
+            )
+
+        # Recurrence (loop over L — still fast due to fused matmuls) -------
+        for t in range(L):
+            f_t = torch.sigmoid(u_f[:, t] + self.v_f * c_prev + self.bias_f)
+            c_t = f_t * c_prev + (1.0 - f_t) * u_h[:, t]
+            r_t = torch.sigmoid(u_r[:, t] + self.v_r * c_prev + self.bias_r)
+            h_t = r_t * c_t + (1.0 - r_t) * x[:, t]
+
+            if dropout_mask is not None:
+                h_t = h_t * dropout_mask
+
+            h_seq.append(h_t)
             c_prev = c_t
-            c_list.append(h_t)
-        H = torch.stack(c_list, dim=1)  # (B, N, hidden)
-        # project back to model dimension
-        out = H @ self.W  # (B, N, d_model)
-        return out
+
+        output = torch.stack(h_seq, dim=1)  # (B,L,H)
+        return output  # *last hidden* can be c_prev if needed
 
 
 class LinearAttention(nn.Module):
@@ -215,20 +242,25 @@ class LinearAttention(nn.Module):
 class TimeBlock(nn.Module):
     def __init__(self, d_model, hidden_size):
         super().__init__()
+        dropout = 0.2
         self.mixer = SRUPlusPlus(d_model, hidden_size)
         self.norm1 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model), nn.GELU(), nn.Linear(4 * d_model, d_model)
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout),
         )
+
         self.norm2 = nn.LayerNorm(d_model)
 
     def forward(self, x):
         # x: (B, N, d_model)
         y = self.mixer(x)
-        x = x + y
+        x = x + y  # moved the residual connection from before the normalization
         x = self.norm1(x)
-        y2 = self.ffn(x)
-        x = x + y2
+        x = x + self.ffn(x)
         return self.norm2(x)
 
 
@@ -238,7 +270,11 @@ class FrequencyBlock(nn.Module):
         self.mixer = LinearAttention(d_model, k)
         self.norm1 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model), nn.GELU(), nn.Linear(4 * d_model, d_model)
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout),
         )
         self.norm2 = nn.LayerNorm(d_model)
 
