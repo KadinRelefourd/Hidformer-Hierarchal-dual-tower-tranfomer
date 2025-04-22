@@ -223,6 +223,7 @@ class LinearAttention(nn.Module):
         self.to_k = nn.Linear(d_model, d_model, bias=False)
         self.to_v = nn.Linear(d_model, d_model, bias=False)
         self.A = nn.Parameter(torch.randn(d_model, k))
+        self.proj_out = nn.Linear(k, d_model, bias=False)
         # share A for B
         self.B = self.A
 
@@ -237,15 +238,15 @@ class LinearAttention(nn.Module):
         )
         out = scores @ V_hat  # (B, N, k)
         # project back
-        return nn.Linear(V_hat.size(-1), x.size(-1))(out)
+        return self.proj_out(out)
 
 
 class TimeBlock(nn.Module):
-    def __init__(self, d_model, hidden_size):
+    def __init__(self, d_model, hidden_size, dropout=0.2):
         super().__init__()
-        dropout = 0.2
-        self.mixer = SRUPlusPlus(d_model, hidden_size)
         self.norm1 = nn.LayerNorm(d_model)
+        self.mixer = SRUpp(d_model, hidden_size, dropout=dropout)
+        self.norm2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
             nn.GELU(),
@@ -253,23 +254,22 @@ class TimeBlock(nn.Module):
             nn.Linear(d_model * 4, d_model),
             nn.Dropout(dropout),
         )
-
-        self.norm2 = nn.LayerNorm(d_model)
 
     def forward(self, x):
         # x: (B, N, d_model)
-        y = self.mixer(x)
-        x = x + y  # moved the residual connection from before the normalization
-        x = self.norm1(x)
-        x = x + self.ffn(x)
-        return self.norm2(x)
+        x_norm = self.norm1(x)
+        x = self.mixer(x_norm) + x
+        x_norm = self.norm2(x)
+        x = x + self.ffn(x_norm)
+        return x
 
 
 class FrequencyBlock(nn.Module):
-    def __init__(self, d_model, k):
+    def __init__(self, d_model, k, dropout=0.2):
         super().__init__()
-        self.mixer = LinearAttention(d_model, k)
         self.norm1 = nn.LayerNorm(d_model)
+        self.mixer = LinearAttention(d_model, k)
+        self.norm2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
             nn.GELU(),
@@ -277,15 +277,14 @@ class FrequencyBlock(nn.Module):
             nn.Linear(d_model * 4, d_model),
             nn.Dropout(dropout),
         )
-        self.norm2 = nn.LayerNorm(d_model)
 
     def forward(self, x):
-        y = self.mixer(x)
-        x = x + y
-        x = self.norm1(x)
-        y2 = self.ffn(x)
-        x = x + y2
-        return self.norm2(x)
+        x_norm = self.norm1(x)
+        x = self.mixer(x_norm) + x
+        x_norm = self.norm1(x)
+        x = self.ffn(x_norm) + x
+
+        return x
 
 
 class Hidformer(nn.Module):
