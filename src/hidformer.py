@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
+from typing import Optional
+import math
 
 
 class RevIN(nn.Module):
@@ -166,7 +169,6 @@ class SRUpp(nn.Module):
     # ------------------------------------------------------------------
     def forward(self, x: Tensor, hidden_init: Optional[Tensor] = None) -> Tensor:
         """Run SRU++ over *x* and return the full output sequence.
-
         Parameters
         ----------
         x : Tensor
@@ -219,6 +221,8 @@ class LinearAttention(nn.Module):
 
     def __init__(self, d_model, k):
         super().__init__()
+        self.k = k
+        self.d_model = d_model
         self.to_q = nn.Linear(d_model, d_model, bias=False)
         self.to_k = nn.Linear(d_model, d_model, bias=False)
         self.to_v = nn.Linear(d_model, d_model, bias=False)
@@ -226,17 +230,21 @@ class LinearAttention(nn.Module):
         self.proj_out = nn.Linear(k, d_model, bias=False)
         # share A for B
         self.B = self.A
+        self.C = nn.Parameter(torch.randn(d_model, k))
 
     def forward(self, x):  # x: (B, N, d_model)
+        B, N, D = x.shape
         Q = self.to_q(x)  # (B, N, d)
         K = self.to_k(x)
         V = self.to_v(x)
+        Q_hat = Q @ self.C  # (B, N, k)
         K_hat = K @ self.A  # (B, N, k)
         V_hat = V @ self.B  # (B, N, k)
-        scores = torch.softmax(
-            (Q @ K_hat.transpose(-1, -2)) / x.size(-1) ** 0.5, dim=-1
+        attn_scores = torch.softmax(
+            (Q_hat @ K_hat.transpose(-1, -2)) / math.sqrt(self.k),  # Use k for scaling
+            dim=-1,
         )
-        out = scores @ V_hat  # (B, N, k)
+        out = attn_scores @ V_hat  # (B, N, k)
         # project back
         return self.proj_out(out)
 
@@ -334,9 +342,7 @@ class Hidformer(nn.Module):
                 TimeBlock(d_model=d_model, hidden_size=d_model, dropout=dropout)
             )
             if i < num_time_blocks - 1:  # Add merger except after last block
-                self.time_mergers.append(
-                    MergenceLayer(d_model=d_model, k=merge_k, mode=merge_mode)
-                )
+                self.time_mergers.append(MergenceLayer(k=merge_k, mode=merge_mode))
 
         self.freq_blocks = nn.ModuleList()
         self.freq_mergers = nn.ModuleList()
@@ -350,9 +356,7 @@ class Hidformer(nn.Module):
                 FrequencyBlock(d_model=d_model, k=freq_k, dropout=dropout)
             )
             if i < num_freq_blocks - 1:
-                self.freq_mergers.append(
-                    MergenceLayer(d_model=d_model, k=merge_k, mode=merge_mode)
-                )
+                self.freq_mergers.append(MergenceLayer(k=merge_k, mode=merge_mode))
 
         # --- Decoder ---
         # Following Fig 4: Adapt final tower outputs, concatenate, then decode
