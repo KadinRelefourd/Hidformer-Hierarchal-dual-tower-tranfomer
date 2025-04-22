@@ -125,7 +125,7 @@ class SRUpp(nn.Module):
         self,
         d_in: int,
         d_hidden: Optional[int] = None,
-        bias: bool = True,
+        bias: bool = False,
         dropout: float = 0.0,
     ):
         super().__init__()
@@ -134,7 +134,7 @@ class SRUpp(nn.Module):
         self.dropout = dropout
 
         # Weight tying with single large projection (QKV style) for efficiency
-        self.weight_proj = nn.Linear(self.d_in, self.d_hidden * 3, bias=bias)
+        # self.weight_proj = nn.Linear(self.d_in, self.d_hidden * 3, bias=bias)
 
         # Gate parameters (Element‑wise) — *vf*, *vr* in the paper.
         self.v_f = nn.Parameter(torch.zeros(self.d_hidden))
@@ -175,9 +175,10 @@ class SRUpp(nn.Module):
             Optional initial hidden state *(B, d_hid)*. Default zeros.
         """
         B, L, _ = x.shape
-        U_lin = self.weight_proj(x)  # (B,L,3·H) from linear path
+        # U_lin = self.weight_proj(x)  # (B,L,3·H) from linear path
         U_attn = self._compute_U(x)  # (B,L,3·H) from attention path
-        U = U_lin + U_attn  # fuse paths
+        # U = U_lin + U_attn  # fuse paths
+        U = U_attn  # use only attention path
 
         # Gate splits -------------------------------------------------
         u_f, u_r, u_h = torch.chunk(U, 3, dim=-1)  # each (B,L,H)
