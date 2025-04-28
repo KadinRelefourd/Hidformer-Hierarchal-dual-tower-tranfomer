@@ -1,4 +1,4 @@
-]import pandas as pd
+import pandas as pd
 import yfinance as yf
 
 def download_data(tickers, start_date, end_date, interval='1d'):
