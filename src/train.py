@@ -78,10 +78,10 @@ def main():
     # --- Configuration ---
     TICKER_LIST_CSV = "./src/tickers.csv"  # Path to your ticker list
     DATA_ROOT_DIR = "./data/"  # Root directory for raw/processed data
-    MODEL_SAVE_PATH = "./model/test_train.pt"  # Path to save best model
+    MODEL_SAVE_PATH = "./model/test_larger_dataset.pt"  # Path to save best model
 
     # Data parameters
-    LOOKBACK_WINDOW = 60  # Lookback window (Hidformer input length T_in)
+    LOOKBACK_WINDOW = 120  # Lookback window (Hidformer input length T_in)
     PREDICTION_HORIZON = 10  # Forecast horizon (Hidformer pred_len H)
     # Features to use (ensure these match columns in downloaded CSVs from getData)
     # Default OHLCV from preprocessing.py
@@ -89,8 +89,8 @@ def main():
     TARGET_COLUMN = "Close"  # Target column for prediction (can be a list too)
 
     # Model parameters (match Hidformer definition)
-    TOKEN_LENGTH = 16
-    STRIDE = 8
+    TOKEN_LENGTH = 24
+    STRIDE = 12
     NUM_TIME_BLOCKS = 4
     NUM_FREQ_BLOCKS = 2
     D_MODEL = 128
