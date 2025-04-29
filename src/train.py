@@ -4,6 +4,7 @@ import torch.optim as optim
 import pandas as pd
 from torch.utils.data import DataLoader
 import numpy as np
+import torch.nn.functional as F
 
 
 # from data_pipeline import DataPipeline
@@ -81,7 +82,7 @@ def main():
     MODEL_SAVE_PATH = "./model/test_larger_dataset.pt"  # Path to save best model
 
     # Data parameters
-    LOOKBACK_WINDOW = 120  # Lookback window (Hidformer input length T_in)
+    LOOKBACK_WINDOW = 128  # Lookback window (Hidformer input length T_in)
     PREDICTION_HORIZON = 10  # Forecast horizon (Hidformer pred_len H)
     # Features to use (ensure these match columns in downloaded CSVs from getData)
     # Default OHLCV from preprocessing.py
@@ -100,7 +101,7 @@ def main():
     MERGE_K = 2
 
     # Training parameters
-    BATCH_SIZE = 32
+    BATCH_SIZE = 64
     LEARNING_RATE = 1e-4
     EPOCHS = 50  # Max epochs, early stopping will likely trigger sooner
     EARLY_STOPPING_PATIENCE = 5  # From Hidformer paper
