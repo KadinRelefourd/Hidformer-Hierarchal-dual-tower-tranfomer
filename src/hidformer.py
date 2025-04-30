@@ -12,7 +12,7 @@ class RevIN(nn.Module):
     Normalizes per-instance, per-channel statistics, then denormalizes output.
     """
 
-    def __init__(self, num_features, eps=1e-5, affine=True):
+    def __init__(self, num_features, eps=1e-5, affine=False):
         super().__init__()
         self.eps = eps
         self.affine = affine
@@ -370,7 +370,8 @@ class Hidformer(nn.Module):
 
         # Final linear head for prediction
         # Predicts pred_len steps for each of the input_dim features
-        self.decoder = nn.Linear(decoder_input_dim, self.pred_len * self.input_dim)
+        self.decoder = nn.Linear(decoder_input_dim, decoder_input_dim)
+        self.decoder2 = nn.Linear(decoder_input_dim, self.pred_len)
 
     def forward(self, x_enc: torch.Tensor) -> torch.Tensor:
         # x_enc: (B, T_in, C) - Input historical data
@@ -476,10 +477,12 @@ class Hidformer(nn.Module):
         )  # (B, d_model * 2)
 
         # Final Decoder
-        pred = self.decoder(combined_features)  # (B, pred_len * input_dim)
+        pred = self.decoder(combined_features)  # (B, d_model * 2)
+        pred = self.decoder2(pred)  # (B, pred_len * input_dim)
 
         # Reshape prediction: (B, pred_len, input_dim)
-        pred = pred.view(B, self.pred_len, self.input_dim)
+        # pred = pred.view(B, self.pred_len, self.input_dim)
+        pred = pred.view(B, self.pred_len, 1)
 
         # Transpose for RevIN: (B, input_dim, pred_len)
         pred = pred.transpose(1, 2)
