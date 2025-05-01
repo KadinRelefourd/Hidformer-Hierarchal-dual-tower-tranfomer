@@ -5,7 +5,125 @@ import matplotlib.pyplot as plt
 import yfinance as yf
 import os
 import argparse
+import pandas as pd  # Make sure pandas is imported at the top
+import numpy as np  # Make sure numpy is imported at the top
 
+
+# <<< ADD THIS FUNCTION >>>
+def save_predictions_to_csv(
+    actual_df: pd.DataFrame,
+    predicted_data: np.ndarray,  # Shape: (num_sequences, pred_horizon, num_features)
+    sequence_end_dates: pd.DatetimeIndex,
+    ticker: str,
+    target_col_name: str,
+    feature_cols: list,
+    pred_horizon: int,
+    output_filename: str = None,
+):
+    """
+    Aligns actual and predicted target values and saves them to a CSV file.
+
+    Args:
+        actual_df (pd.DataFrame): DataFrame containing actual stock data with DatetimeIndex.
+        predicted_data (np.ndarray): The denormalized output from the model.
+        sequence_end_dates (pd.DatetimeIndex): The end dates of the input sequences used for prediction.
+        ticker (str): Stock ticker symbol.
+        target_col_name (str): Name of the target column (e.g., 'Close').
+        feature_cols (list): List of all feature names used by the model.
+        pred_horizon (int): The prediction horizon length.
+        output_filename (str, optional): Name for the output CSV file.
+                                         Defaults to f"{ticker}_predictions.csv".
+    """
+    print(f"\n--- Saving predictions for {ticker} to CSV ---")
+
+    if output_filename is None:
+        output_filename = f"{ticker}_predictions.csv"
+
+    try:
+        target_col_idx = feature_cols.index(target_col_name)
+    except ValueError:
+        print(
+            f"Error: Target column '{target_col_name}' not found in feature_cols: {feature_cols}"
+        )
+        return
+
+    results_list = []
+    actual_dates_index = actual_df.index
+
+    # Iterate through each prediction generated
+    for i, seq_end_date in enumerate(sequence_end_dates):
+        # Find the actual calendar dates for the prediction period following seq_end_date
+        potential_prediction_dates = actual_dates_index[
+            actual_dates_index > seq_end_date
+        ]
+
+        if len(potential_prediction_dates) >= pred_horizon:
+            prediction_dates = potential_prediction_dates[:pred_horizon]
+        else:
+            # Handle cases where actual data doesn't cover the full horizon
+            prediction_dates = potential_prediction_dates
+            print(
+                f"Warning: Sequence ending {seq_end_date.date()} has only "
+                f"{len(prediction_dates)} actual dates following it (needed {pred_horizon})."
+            )
+
+        if prediction_dates.empty:
+            print(
+                f"Warning: No actual dates found after sequence ending {seq_end_date.date()}. Skipping."
+            )
+            continue
+
+        # Get actual values for the target dates
+        try:
+            actual_vals = actual_df.loc[prediction_dates, target_col_name].values
+        except KeyError:
+            print(
+                f"Warning: Could not retrieve actual values for dates starting after {seq_end_date.date()}. Skipping."
+            )
+            continue
+
+        # Get predicted values for this window's horizon
+        # Slice prediction array based on the number of available actual dates
+        predicted_vals = predicted_data[i, : len(prediction_dates), target_col_idx]
+
+        # Store data for this prediction window
+        row_data = {"Input_Seq_End_Date": seq_end_date}
+        for h in range(len(prediction_dates)):
+            row_data[f"Target_Date_H{h+1}"] = prediction_dates[h]
+            row_data[f"Actual_H{h+1}"] = actual_vals[h]
+            row_data[f"Predicted_H{h+1}"] = predicted_vals[h]
+            # Fill remaining columns with NaN if horizon is shorter than expected
+            if len(prediction_dates) < pred_horizon and h == len(prediction_dates) - 1:
+                for h_fill in range(len(prediction_dates), pred_horizon):
+                    row_data[f"Target_Date_H{h_fill+1}"] = pd.NaT
+                    row_data[f"Actual_H{h_fill+1}"] = np.nan
+                    row_data[f"Predicted_H{h_fill+1}"] = np.nan
+
+        results_list.append(row_data)
+
+    if not results_list:
+        print("Error: No prediction data could be aligned and saved.")
+        return
+
+    # Create DataFrame and save
+    results_df = pd.DataFrame(results_list)
+    # Reorder columns for readability
+    cols_order = ["Input_Seq_End_Date"]
+    for h in range(pred_horizon):
+        cols_order.extend(
+            [f"Target_Date_H{h+1}", f"Actual_H{h+1}", f"Predicted_H{h+1}"]
+        )
+    # Ensure all expected columns exist, even if empty due to short data
+    results_df = results_df.reindex(columns=cols_order)
+
+    try:
+        results_df.to_csv(output_filename, index=False, date_format="%Y-%m-%d")
+        print(f"Successfully saved predictions to {output_filename}")
+    except Exception as e:
+        print(f"Error saving predictions to CSV: {e}")
+
+
+# <<< END OF ADDED FUNCTION >>>
 # Assume hidformer.py is in the same directory or accessible via PYTHONPATH
 try:
     from hidformer import Hidformer
@@ -16,21 +134,21 @@ except ImportError:
     exit()
 
 # --- Default Configuration ---
-DEFAULT_MODEL_PATH = "./model/test_larger_dataset.pt"
-DEFAULT_TICKER = "ATUS"
+DEFAULT_MODEL_PATH = "./model/test_larger_dataset_128.pt"
+DEFAULT_TICKER = "lly"
 DEFAULT_START_DATE = "2023-01-01"
 DEFAULT_END_DATE = "2024-01-01"  # Predict up to this date
 
 # --- Model & Data Parameters (MUST match training) ---
 LOOKBACK_WINDOW = 128
-PREDICTION_HORIZON = 10  # From training
+PREDICTION_HORIZON = 128  # From training
 FEATURE_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]  # From training
 TARGET_COLUMN = "Close"  # From training
 INPUT_DIM = len(FEATURE_COLUMNS)
 
 # Model Hyperparameters (MUST match the trained model)
-TOKEN_LENGTH = 24
-STRIDE = 12
+TOKEN_LENGTH = 32
+STRIDE = 16
 NUM_TIME_BLOCKS = 4
 NUM_FREQ_BLOCKS = 2
 D_MODEL = 128
@@ -532,7 +650,17 @@ if __name__ == "__main__":
     if predictions_denorm is None:
         print("Exiting: Inference failed.")
         exit()
-
+    save_predictions_to_csv(
+        actual_df=df_actual,
+        predicted_data=predictions_denorm,
+        sequence_end_dates=sequence_end_dates,
+        ticker=args.ticker,
+        target_col_name=TARGET_COLUMN,
+        feature_cols=FEATURE_COLUMNS,
+        pred_horizon=PREDICTION_HORIZON,
+        # Optional: specify a different filename
+        # output_filename=f"{args.ticker}_detailed_preds.csv"
+    )
     # --- Visualize ---
     plot_predictions_vs_actual(
         actual_df=df_actual,

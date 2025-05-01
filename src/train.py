@@ -86,20 +86,20 @@ def main():
     TICKER_LIST_CSV = "./src/tickers.csv"  # Path to your ticker list
     DATA_ROOT_DIR = "./data/"  # Root directory for raw/processed data
     MODEL_SAVE_PATH = (
-        "./model/test_larger_dataset.pt"  # Path to save best model (updated name)
+        "./model/test_larger_dataset_128.pt"  # Path to save best model (updated name)
     )
     # SCALER_SAVE_PATH = "./model/input_scaler.joblib"  # Path to save the fitted scaler
 
     # Data parameters
     LOOKBACK_WINDOW = 128  # Lookback window (Hidformer input length T_in)
-    PREDICTION_HORIZON = 10  # Forecast horizon (Hidformer pred_len H)
+    PREDICTION_HORIZON = 128  # Forecast horizon (Hidformer pred_len H)
     # Features to use (ensure these match columns in downloaded CSVs from getData)
     FEATURE_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
     TARGET_COLUMN = "Close"  # Target column for prediction (can be a list too)
 
     # Model parameters (match Hidformer definition)
-    TOKEN_LENGTH = 24
-    STRIDE = 12
+    TOKEN_LENGTH = 32
+    STRIDE = 16
     NUM_TIME_BLOCKS = 4
     NUM_FREQ_BLOCKS = 2
     D_MODEL = 128
@@ -196,8 +196,23 @@ def main():
     )
 
     # --- Loss and Optimizer ---
-    criterion = nn.MSELoss()  # Use MSE as per Hidformer paper
+    # criterion = nn.MSELoss()  # Use MSE as per Hidformer paper
+    # criterion = nn.L1Loss()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+    # --- <<< ADD WEIGHTED MSE SETUP >>> ---
+    # Create weights: tensor from H down to 1
+    weights = torch.linspace(PREDICTION_HORIZON, 1, PREDICTION_HORIZON)
+    # Normalize weights so the average weight is 1.0
+    # This keeps the overall scale of the loss similar to standard MSE
+    weights = weights / torch.mean(weights)
+    # Reshape for broadcasting: (1, H, 1) -> matches (B, H, C) tensors
+    # and move to the correct device
+    weights = weights.view(1, -1, 1).to(device)
+    print(
+        f"Using weighted MSE with weights: {weights.squeeze().cpu().numpy()}"
+    )  # Print weights for verification
+    # --- <<< END WEI
 
     # --- Early Stopping Initialization ---
     early_stopping = EarlyStopping(
@@ -251,7 +266,18 @@ def main():
                 )
 
             # Loss is calculated between denormalized prediction and original target
-            loss = criterion(pred_for_loss, y)
+            # --- Weighted MSE Calculation ---
+            # Calculate element-wise squared error
+            squared_errors = (pred_for_loss - y) ** 2
+            # Apply weights (broadcasting along Batch and Channel dimensions)
+            weighted_squared_errors = squared_errors * weights
+            # Calculate the mean over all elements
+            loss = torch.mean(weighted_squared_errors)
+            # --- End Weighted MSE Calculation ---
+
+            # loss = criterion(pred_for_loss, y) # REMOVE or COMMENT OUT old line
+
+            # loss = criterion(pred_for_loss, y)
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
@@ -285,8 +311,14 @@ def main():
                         f"Shape mismatch during validation: pred={pv_for_loss.shape}, target={yv.shape}"
                     )
 
-                # Loss calculated between denormalized prediction and original target
-                val_loss += criterion(pv_for_loss, yv).item()
+                # --- Weighted MSE Calculation ---
+                val_squared_errors = (pv_for_loss - yv) ** 2
+                val_weighted_squared_errors = val_squared_errors * weights
+                val_batch_loss = torch.mean(val_weighted_squared_errors)
+                # --- End Weighted MSE Calculation ---
+
+                # val_loss += criterion(pv_for_loss, yv).item() # REMOVE or COMMENT OUT old line
+                val_loss += val_batch_loss.item()  # Add the calculated weighted loss
                 val_batch_count += 1
 
         avg_val_loss = val_loss / val_batch_count
@@ -344,7 +376,12 @@ def main():
                 )
 
             # Loss calculated between denormalized prediction and original target
-            test_loss += criterion(pt_for_loss, yt).item()
+            # --- Weighted MSE Calculation ---
+            test_squared_errors = (pt_for_loss - yt) ** 2
+            test_weighted_squared_errors = test_squared_errors * weights
+            test_batch_loss = torch.mean(test_weighted_squared_errors)
+            # --- End Weighted MSE Calculation ---
+            test_loss += test_batch_loss.item()
             test_batch_count += 1
 
     avg_test_loss = test_loss / test_batch_count
