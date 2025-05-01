@@ -81,13 +81,11 @@ class EarlyStopping:
         self.val_loss_min = val_loss
 
 
-def main():
+def main(T_blocks=4, F_blocks=2, D_model=256, dropout=0.2, freq_k=64):
     # --- Configuration ---
     TICKER_LIST_CSV = "./src/tickers.csv"  # Path to your ticker list
     DATA_ROOT_DIR = "./data/"  # Root directory for raw/processed data
-    MODEL_SAVE_PATH = (
-        "./model/test_larger_dataset_128.pt"  # Path to save best model (updated name)
-    )
+    MODEL_SAVE_PATH = f"./model/128_128_{T_blocks}_{F_blocks}_{D_model}_{dropout}_{freq_k}.pt"  # Path to save best model (updated name)
     # SCALER_SAVE_PATH = "./model/input_scaler.joblib"  # Path to save the fitted scaler
 
     # Data parameters
@@ -100,11 +98,11 @@ def main():
     # Model parameters (match Hidformer definition)
     TOKEN_LENGTH = 32
     STRIDE = 16
-    NUM_TIME_BLOCKS = 4
-    NUM_FREQ_BLOCKS = 2
-    D_MODEL = 128
-    FREQ_K = 64
-    DROPOUT = 0.2
+    NUM_TIME_BLOCKS = T_blocks  # Number of time blocks (T_blocks)
+    NUM_FREQ_BLOCKS = F_blocks  # Number of frequency blocks (F_blocks)
+    D_MODEL = D_model
+    FREQ_K = freq_k  # Frequency dimension (F_k)
+    DROPOUT = dropout  # Dropout rate (0.2 as per Hidformer paper)
     MERGE_MODE = "linear"
     MERGE_K = 2
 
@@ -121,6 +119,7 @@ def main():
     # --- Data Preparation using preprocessing.py ---
     print("--- Preparing Data ---")
     # Read tickers from CSV
+    ret = []
     try:
         print("Loading/Creating train dataset (unscaled)...")
         train_ds = createDataset(  # <<< Use train_ds directly
@@ -325,7 +324,7 @@ def main():
         print(
             f"Epoch {epoch:02d}/{EPOCHS} — Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}"
         )
-
+        ret.append(avg_val_loss)
         # --- Early Stopping Check ---
         # Note: Early stopping is still based on the loss in the original price scale
         early_stopping(avg_val_loss, model)
@@ -405,7 +404,38 @@ def main():
             test_mae += F.l1_loss(pt_for_loss, yt).item()
     avg_test_mae = test_mae / test_batch_count
     print(f"Test MAE: {avg_test_mae:.6f}")
+    return ret
 
 
 if __name__ == "__main__":
-    main()
+    labels = []
+    results = []
+    for T_blocks in [4]:
+        for F_blocks in [2]:
+            for D_model in [128, 256, 512]:
+                for dropout in [0.1, 0.15, 0.2]:
+                    for freq_k in [64, 128, 256]:
+                        print(
+                            f"Running with T_blocks={T_blocks}, F_blocks={F_blocks}, D_model={D_model}, dropout={dropout}, freq_k={freq_k}"
+                        )
+                        labels.append(
+                            f"{T_blocks}_{F_blocks}_{D_model}_{dropout}_{freq_k}"
+                        )
+                        result = main(
+                            T_blocks=T_blocks,
+                            F_blocks=F_blocks,
+                            D_model=D_model,
+                            dropout=dropout,
+                            freq_k=freq_k,
+                        )
+                        results.append(result)
+
+    # graph results
+    df = pd.DataFrame(results, index=labels)
+    df.to_csv("results.csv")
+
+    # graph the results over the epochs
+    print(df)
+
+    # main(T_blocks, F_blocks, D_model, dropout, freq_k)
+    # main()

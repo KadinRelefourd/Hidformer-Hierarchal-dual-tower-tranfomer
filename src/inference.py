@@ -123,8 +123,6 @@ def save_predictions_to_csv(
         print(f"Error saving predictions to CSV: {e}")
 
 
-# <<< END OF ADDED FUNCTION >>>
-# Assume hidformer.py is in the same directory or accessible via PYTHONPATH
 try:
     from hidformer import Hidformer
 except ImportError:
@@ -134,7 +132,7 @@ except ImportError:
     exit()
 
 # --- Default Configuration ---
-DEFAULT_MODEL_PATH = "./model/test_larger_dataset_128.pt"
+DEFAULT_MODEL_PATH = "./model/128_128_4_2_128_0.2_256.pt"
 DEFAULT_TICKER = "lly"
 DEFAULT_START_DATE = "2023-01-01"
 DEFAULT_END_DATE = "2024-01-01"  # Predict up to this date
@@ -152,7 +150,7 @@ STRIDE = 16
 NUM_TIME_BLOCKS = 4
 NUM_FREQ_BLOCKS = 2
 D_MODEL = 128
-FREQ_K = 64
+FREQ_K = 256
 DROPOUT = 0.2
 MERGE_MODE = "linear"
 MERGE_K = 2
@@ -180,8 +178,7 @@ def download_stock_data(ticker, start, end, feature_cols):
         # Use auto_adjust=True consistent with preprocessing.getData
         ticker_data = yf.download(
             ticker,
-            start=start,
-            end=end,
+            period="max",
             progress=False,
             auto_adjust=True,  # Gets adjusted OHLC, Volume might be unadjusted/missing
             # group_by="ticker", # Not needed for single ticker download
